@@ -1,0 +1,17 @@
+[project]
+name = "video-analyzer"
+version = "0.1.0"
+description = "Extract transcripts and analyze videos from YouTube, X, TikTok, and more"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "click>=8.3.3",
+    "langfuse>=4.5.1",
+    "python-dotenv>=1.2.2",
+    "requests>=2.33.1",
+    "rich>=15.0.0",
+    "youtube-transcript-api>=1.2.4",
+]
+
+[project.scripts]
+va = "main:main"

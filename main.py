@@ -96,7 +96,17 @@ Output JSON with these fields:
 - action_items: array of actionable advice if any (empty array if none)"""
 
 
-def extract_video_id(url_or_id: str) -> str:
+def is_youtube_url(url_or_id: str) -> bool:
+    """Return True if the input looks like a YouTube URL or bare video ID."""
+    patterns = [
+        r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)[a-zA-Z0-9_-]{11}",
+        r"^[a-zA-Z0-9_-]{11}$",
+    ]
+    return any(re.search(p, url_or_id) for p in patterns)
+
+
+def extract_video_id(url_or_id: str) -> str | None:
+    """Extract YouTube video ID. Returns None for non-YouTube URLs."""
     patterns = [
         r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/shorts/)([a-zA-Z0-9_-]{11})",
         r"^([a-zA-Z0-9_-]{11})$",
@@ -105,7 +115,13 @@ def extract_video_id(url_or_id: str) -> str:
         match = re.search(pattern, url_or_id)
         if match:
             return match.group(1)
-    raise click.BadParameter(f"Could not extract video ID from: {url_or_id}")
+    return None
+
+
+def url_cache_key(url: str) -> str:
+    """Generate a short cache key from a URL hash."""
+    import hashlib
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
 
 
 def get_proxy_config():
@@ -166,7 +182,8 @@ def fetch_transcript_captions(video_id: str, languages: list[str] | None = None)
     }
 
 
-def download_audio(video_id: str, tmpdir: str) -> str:
+def download_audio(url: str, tmpdir: str) -> str:
+    """Download audio from any URL via yt-dlp."""
     out_path = os.path.join(tmpdir, "audio.%(ext)s")
     cmd = [
         "yt-dlp", "-x",
@@ -174,7 +191,7 @@ def download_audio(video_id: str, tmpdir: str) -> str:
         "--audio-quality", "9",
         "--max-filesize", "24M",
         "-o", out_path,
-        f"https://www.youtube.com/watch?v={video_id}",
+        url,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -225,7 +242,8 @@ def transcribe_audio(audio_path: str, api_key: str, model: str = DEFAULT_TRANSCR
     }
 
 
-def fetch_transcript(video_id: str, languages: list[str] | None = None, api_key: str | None = None, no_cache: bool = False, meta: dict | None = None) -> dict:
+def fetch_transcript_yt(video_id: str, url: str, languages: list[str] | None = None, api_key: str | None = None, no_cache: bool = False, meta: dict | None = None) -> dict:
+    """Fetch transcript for a YouTube video: captions first, then yt-dlp audio fallback."""
     if not no_cache:
         cached = cache_get(video_id, "transcript")
         if cached:
@@ -245,10 +263,27 @@ def fetch_transcript(video_id: str, languages: list[str] | None = None, api_key:
         console.log(f"[yellow]⚠[/yellow] No captions — falling back to audio transcription")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            audio_path = download_audio(video_id, tmpdir)
+            audio_path = download_audio(url, tmpdir)
             result = transcribe_audio(audio_path, api_key)
 
     cache_set(video_id, "transcript", result, meta=meta)
+    return result
+
+
+def fetch_transcript_generic(url: str, cache_key: str, api_key: str, no_cache: bool = False, meta: dict | None = None) -> dict:
+    """Fetch transcript for a non-YouTube URL via yt-dlp audio + transcription."""
+    if not no_cache:
+        cached = cache_get(cache_key, "transcript")
+        if cached:
+            console.log(f"[green]✓[/green] Transcript loaded from cache")
+            return cached
+
+    console.log(f"Downloading audio via yt-dlp...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_path = download_audio(url, tmpdir)
+        result = transcribe_audio(audio_path, api_key)
+
+    cache_set(cache_key, "transcript", result, meta=meta)
     return result
 
 
@@ -438,10 +473,11 @@ def render_transcript(result: dict, timestamps: bool):
 def main(video, open_cache, lang, json_output, metadata, timestamps, proxy, force_transcribe, model, analyze, verify, prompt, analysis_model, no_cache):
     """Analyze a video by extracting its transcript.
 
-    VIDEO can be a YouTube URL or video ID.
+    VIDEO can be a YouTube URL, video ID, or any video URL supported by yt-dlp
+    (Twitter/X, TikTok, Instagram, direct mp4 links, etc.).
 
-    Uses YouTube captions when available (free), falls back to audio
-    transcription via OpenRouter when captions are missing.
+    For YouTube: tries captions first (free), then falls back to audio transcription.
+    For other URLs: downloads audio via yt-dlp and transcribes via OpenRouter.
     """
     if open_cache:
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -451,8 +487,13 @@ def main(video, open_cache, lang, json_output, metadata, timestamps, proxy, forc
     if not video:
         raise click.UsageError("Missing argument 'VIDEO'. Use --open-cache or provide a video URL/ID.")
 
-    video_id = extract_video_id(video)
     api_key = os.environ.get("OPENROUTER_API_KEY")
+    youtube = is_youtube_url(video)
+    video_id = extract_video_id(video) if youtube else None
+    # For YouTube bare IDs, build the full URL for yt-dlp
+    yt_url = f"https://www.youtube.com/watch?v={video_id}" if (youtube and video_id and not video.startswith("http")) else video
+    # Cache key: YouTube video ID or hash of URL
+    c_key = video_id or url_cache_key(video)
 
     if proxy and not os.environ.get("EVOMI_USER"):
         raise click.ClickException("--proxy requires EVOMI_USER and EVOMI_PASS env vars")
@@ -460,34 +501,40 @@ def main(video, open_cache, lang, json_output, metadata, timestamps, proxy, forc
     if force_transcribe and not api_key:
         raise click.ClickException("--force-transcribe requires OPENROUTER_API_KEY env var")
 
+    if not youtube and not api_key:
+        raise click.ClickException("Non-YouTube URLs require OPENROUTER_API_KEY for audio transcription.")
+
     lf = Langfuse()
 
-    console.log(f"[bold]Video:[/bold] [cyan]{video_id}[/cyan]")
+    console.log(f"[bold]Video:[/bold] [cyan]{video_id or video}[/cyan]")
 
     languages = list(lang) if lang else None
 
+    # Metadata: only fetch for YouTube
     meta = None
-    if metadata:
+    if metadata and youtube and video_id:
         if not no_cache:
-            meta = cache_get(video_id, "metadata")
+            meta = cache_get(c_key, "metadata")
             if meta:
                 console.log(f"[bold]Title:[/bold] {meta['title']} [dim](cached)[/dim]")
                 console.log(f"[bold]Author:[/bold] {meta['author']}")
         if not meta:
             meta = fetch_metadata(video_id)
             if meta:
-                cache_set(video_id, "metadata", meta, meta=meta)
+                cache_set(c_key, "metadata", meta, meta=meta)
                 console.log(f"[bold]Title:[/bold] {meta['title']}")
                 console.log(f"[bold]Author:[/bold] {meta['author']}")
 
     if force_transcribe:
         console.log("[yellow]Forced transcription mode[/yellow] — downloading audio...")
         with tempfile.TemporaryDirectory() as tmpdir:
-            audio_path = download_audio(video_id, tmpdir)
+            audio_path = download_audio(yt_url, tmpdir)
             result = transcribe_audio(audio_path, api_key, model)
-            cache_set(video_id, "transcript", result, meta=meta)
+            cache_set(c_key, "transcript", result, meta=meta)
+    elif youtube and video_id:
+        result = fetch_transcript_yt(video_id, yt_url, languages, api_key, no_cache=no_cache, meta=meta)
     else:
-        result = fetch_transcript(video_id, languages, api_key, no_cache=no_cache, meta=meta)
+        result = fetch_transcript_generic(video, c_key, api_key, no_cache=no_cache, meta=meta)
 
     if prompt or verify:
         analyze = True
@@ -495,11 +542,11 @@ def main(video, open_cache, lang, json_output, metadata, timestamps, proxy, forc
     analysis = None
     if analyze:
         console.log(f"Analyzing with [cyan]{analysis_model}[/cyan]{'  [dim](+ verify)[/dim]' if verify else ''}...")
-        analysis = analyze_transcript(result["full_text"], meta, analysis_model, lf=lf, video_id=video_id, no_cache=no_cache or bool(prompt), custom_prompt=prompt, verify=verify)
+        analysis = analyze_transcript(result["full_text"], meta, analysis_model, lf=lf, video_id=c_key, no_cache=no_cache or bool(prompt), custom_prompt=prompt, verify=verify)
 
     # Output
     if json_output:
-        output = {"video_id": video_id}
+        output = {"video_id": video_id} if video_id else {"url": video}
         if meta:
             output["metadata"] = meta
         output["transcript"] = result

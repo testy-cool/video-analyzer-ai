@@ -3,3 +3,4 @@
 __pycache__/
 *.pyc
 video_analyzer.egg-info/
+.mcp.json

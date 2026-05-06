@@ -125,13 +125,10 @@ def url_cache_key(url: str) -> str:
 
 
 def get_proxy_config():
-    user = os.environ.get("EVOMI_USER")
-    password = os.environ.get("EVOMI_PASS")
-    if not user or not password:
+    proxy_url = get_proxy_url()
+    if not proxy_url:
         return None
-    return WebshareProxyConfig(
-        proxy_url=f"http://{user}:{password}@core-residential.evomi.com:1000"
-    )
+    return WebshareProxyConfig(proxy_url=proxy_url)
 
 
 def fetch_metadata(video_id: str) -> dict | None:
@@ -182,7 +179,15 @@ def fetch_transcript_captions(video_id: str, languages: list[str] | None = None)
     }
 
 
-def download_audio(url: str, tmpdir: str) -> str:
+def get_proxy_url() -> str | None:
+    user = os.environ.get("EVOMI_USER")
+    password = os.environ.get("EVOMI_PASS")
+    if not user or not password:
+        return None
+    return f"http://{user}:{password}@core-residential.evomi.com:1000"
+
+
+def download_audio(url: str, tmpdir: str, use_proxy: bool = False) -> str:
     """Download audio from any URL via yt-dlp."""
     out_path = os.path.join(tmpdir, "audio.%(ext)s")
     cmd = [
@@ -191,8 +196,13 @@ def download_audio(url: str, tmpdir: str) -> str:
         "--audio-quality", "9",
         "--max-filesize", "24M",
         "-o", out_path,
-        url,
     ]
+    if use_proxy:
+        proxy_url = get_proxy_url()
+        if proxy_url:
+            cmd.extend(["--proxy", proxy_url])
+            console.log("[dim]Using Evomi proxy[/dim]")
+    cmd.append(url)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"yt-dlp failed: {result.stderr.strip()}")
@@ -242,7 +252,7 @@ def transcribe_audio(audio_path: str, api_key: str, model: str = DEFAULT_TRANSCR
     }
 
 
-def fetch_transcript_yt(video_id: str, url: str, languages: list[str] | None = None, api_key: str | None = None, no_cache: bool = False, meta: dict | None = None) -> dict:
+def fetch_transcript_yt(video_id: str, url: str, languages: list[str] | None = None, api_key: str | None = None, no_cache: bool = False, meta: dict | None = None, use_proxy: bool = False) -> dict:
     """Fetch transcript for a YouTube video: captions first, then yt-dlp audio fallback."""
     if not no_cache:
         cached = cache_get(video_id, "transcript")
@@ -263,14 +273,14 @@ def fetch_transcript_yt(video_id: str, url: str, languages: list[str] | None = N
         console.log(f"[yellow]⚠[/yellow] No captions — falling back to audio transcription")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            audio_path = download_audio(url, tmpdir)
+            audio_path = download_audio(url, tmpdir, use_proxy=use_proxy)
             result = transcribe_audio(audio_path, api_key)
 
     cache_set(video_id, "transcript", result, meta=meta)
     return result
 
 
-def fetch_transcript_generic(url: str, cache_key: str, api_key: str, no_cache: bool = False, meta: dict | None = None) -> dict:
+def fetch_transcript_generic(url: str, cache_key: str, api_key: str, no_cache: bool = False, meta: dict | None = None, use_proxy: bool = False) -> dict:
     """Fetch transcript for a non-YouTube URL via yt-dlp audio + transcription."""
     if not no_cache:
         cached = cache_get(cache_key, "transcript")
@@ -280,7 +290,7 @@ def fetch_transcript_generic(url: str, cache_key: str, api_key: str, no_cache: b
 
     console.log(f"Downloading audio via yt-dlp...")
     with tempfile.TemporaryDirectory() as tmpdir:
-        audio_path = download_audio(url, tmpdir)
+        audio_path = download_audio(url, tmpdir, use_proxy=use_proxy)
         result = transcribe_audio(audio_path, api_key)
 
     cache_set(cache_key, "transcript", result, meta=meta)
@@ -495,7 +505,7 @@ def main(video, open_cache, lang, json_output, metadata, timestamps, proxy, forc
     # Cache key: YouTube video ID or hash of URL
     c_key = video_id or url_cache_key(video)
 
-    if proxy and not os.environ.get("EVOMI_USER"):
+    if proxy and not get_proxy_url():
         raise click.ClickException("--proxy requires EVOMI_USER and EVOMI_PASS env vars")
 
     if force_transcribe and not api_key:
@@ -528,13 +538,13 @@ def main(video, open_cache, lang, json_output, metadata, timestamps, proxy, forc
     if force_transcribe:
         console.log("[yellow]Forced transcription mode[/yellow] — downloading audio...")
         with tempfile.TemporaryDirectory() as tmpdir:
-            audio_path = download_audio(yt_url, tmpdir)
+            audio_path = download_audio(yt_url, tmpdir, use_proxy=proxy)
             result = transcribe_audio(audio_path, api_key, model)
             cache_set(c_key, "transcript", result, meta=meta)
     elif youtube and video_id:
-        result = fetch_transcript_yt(video_id, yt_url, languages, api_key, no_cache=no_cache, meta=meta)
+        result = fetch_transcript_yt(video_id, yt_url, languages, api_key, no_cache=no_cache, meta=meta, use_proxy=proxy)
     else:
-        result = fetch_transcript_generic(video, c_key, api_key, no_cache=no_cache, meta=meta)
+        result = fetch_transcript_generic(video, c_key, api_key, no_cache=no_cache, meta=meta, use_proxy=proxy)
 
     if prompt or verify:
         analyze = True

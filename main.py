@@ -406,6 +406,8 @@ def analyze_transcript(transcript_text: str, metadata: dict | None = None, model
 
     if use_json_mode:
         parsed = json.loads(content)
+        if isinstance(parsed, list) and len(parsed) == 1:
+            parsed = parsed[0]
         if video_id:
             model_tag = model.replace("/", "_")
             cache_set(video_id, f"analysis.{model_tag}", parsed, meta=metadata)
@@ -538,7 +540,8 @@ def render_transcript(result: dict, timestamps: bool):
 @click.option("--prompt", "-q", default=None, help="Custom analysis prompt (replaces default)")
 @click.option("--analysis-model", default=DEFAULT_ANALYSIS_MODEL, help="Model for analysis")
 @click.option("--no-cache", is_flag=True, help="Skip cache, fetch fresh data")
-def main(video, open_cache, lang, json_output, metadata, timestamps, proxy, force_transcribe, model, analyze, verify, prompt, analysis_model, no_cache):
+@click.option("--chat", "-c", is_flag=True, help="Chat about the video after analysis")
+def main(video, open_cache, lang, json_output, metadata, timestamps, proxy, force_transcribe, model, analyze, verify, prompt, analysis_model, no_cache, chat):
     """Analyze a video by extracting its transcript.
 
     VIDEO can be a YouTube URL, video ID, or any video URL supported by yt-dlp
@@ -604,7 +607,7 @@ def main(video, open_cache, lang, json_output, metadata, timestamps, proxy, forc
     else:
         result = fetch_transcript_generic(video, c_key, api_key, no_cache=no_cache, meta=meta, use_proxy=proxy)
 
-    if prompt or verify:
+    if prompt or verify or chat:
         analyze = True
 
     analysis = None
@@ -627,6 +630,52 @@ def main(video, open_cache, lang, json_output, metadata, timestamps, proxy, forc
         render_analysis(analysis, meta)
     else:
         render_transcript(result, timestamps)
+
+    if chat:
+        start_chat(result["full_text"], analysis, meta, analysis_model)
+
+
+def start_chat(transcript_text: str, analysis: dict | None, meta: dict | None, model_name: str):
+    from llm.default_plugins.openai_models import Chat
+
+    llm_model = Chat(
+        model_id="va-chat",
+        model_name=model_name,
+        api_base=ANALYSIS_BASE_URL.replace("/chat/completions", ""),
+    )
+    llm_model.key = ANALYSIS_API_KEY
+
+    title = meta["title"] if meta else "this video"
+    system = f"You have the full transcript of \"{title}\" and its analysis. Answer questions about it. Be direct and specific — quote the transcript when relevant. Stay grug-brained: no fluff, opinions welcome."
+
+    context = f"TRANSCRIPT:\n{transcript_text}"
+    if analysis:
+        context += f"\n\nANALYSIS:\n{json.dumps(analysis, ensure_ascii=False)}"
+
+    conv = llm_model.conversation()
+    # seed with transcript context
+    r = conv.prompt(context, system=system)
+    r.text()  # consume but don't print the seed response
+
+    out.print()
+    out.print("[bold]Chat mode[/bold] — ask anything about the video. [dim]Ctrl+C to exit.[/dim]")
+    out.print()
+
+    try:
+        while True:
+            try:
+                question = input("you> ").strip()
+            except EOFError:
+                break
+            if not question:
+                continue
+            response = conv.prompt(question)
+            for chunk in response:
+                print(chunk, end="", flush=True)
+            print()
+            print()
+    except KeyboardInterrupt:
+        out.print("\n[dim]bye[/dim]")
 
 
 if __name__ == "__main__":

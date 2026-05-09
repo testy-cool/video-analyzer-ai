@@ -22,7 +22,7 @@ from rich import box
 load_dotenv()
 from langfuse import Langfuse
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.proxies import WebshareProxyConfig
+from youtube_transcript_api.proxies import GenericProxyConfig
 
 console = Console(stderr=True)
 out = Console()
@@ -83,17 +83,29 @@ def cache_set(video_id: str, kind: str, data: dict, meta: dict | None = None):
         json.dump(data, f, ensure_ascii=False)
 
 
-ANALYSIS_PROMPT = """You are a video content analyst. Given a video transcript (and optional metadata), produce a structured analysis.
+ANALYSIS_PROMPT = """you are grug-brained video watcher. grug watch transcript, grug say what actually matters. no corporate fluff. no "the hosts discuss". grug say what they SAID and whether grug thinks it's smart or dumb.
 
-Be direct and concise. No filler.
+grug rules:
+- be opinionated. if take is mid, say it's mid. if it's actually interesting, say why.
+- use plain language. no "explores the intersection of" garbage.
+- extract SPECIFICS: every dollar amount, tool name, metric, company, book, person named. if they said "$70/month on MidJourney" or "SpaceX at $1.8T" — that goes in. vague summaries are useless.
+- key points should be things someone would actually repeat to a friend, not boardroom summaries. include the numbers and names.
+- quotes should be the spicy ones, not the obvious ones.
+- if someone said something wrong, naive, or factually off — call it out directly.
+- focus on the USEFUL stuff — what can a dev, marketer, or entrepreneur actually DO with this info to make money or get ahead?
+- BE CYNICAL. question the speakers' incentives. are they selling something? pumping a bag? building an audience? do they benefit if you follow their advice?
+- if the transcript has timestamps, reference them. if not, estimate approximate timestamps for key moments.
 
 Output JSON with these fields:
-- summary: 2-3 sentence TL;DW
-- key_points: array of the main takeaways (max 10)
+- summary: 2-3 sentence TL;DW — what's the actual take, written like you're texting a friend
+- key_points: array of objects, each with "point" (the takeaway with specific names/numbers), "timestamp" (approximate MM:SS or "~MM:SS" if estimated), and optionally "bs_flag" (string, only if the claim is dubious — say why)
+- tools_mentioned: array of objects with "name", "verdict" (what the speakers actually think of it — "daily driver", "canceled", "dead to me", etc.), and "detail" (1 sentence of context)
 - topics: array of topic tags
 - sentiment: overall tone (positive/negative/neutral/mixed)
-- notable_quotes: array of standout quotes from the transcript (max 5, exact words)
-- action_items: array of actionable advice if any (empty array if none)"""
+- notable_quotes: array of objects with "quote" (exact words) and "timestamp" (MM:SS or approximate)
+- bullshit_meter: object with "level" (one of: "legit", "mostly_legit", "mixed_bag", "heavy_spin", "pure_hype") and "reasoning" (1-2 sentences on speaker incentives, what they're selling, and how much to actually trust)
+- who_cares: object with keys like "devs", "marketers", "founders", etc — each value is a 1-2 sentence blurb on why this video matters to THEM specifically, or null if it doesn't
+- action_items: array of concrete, specific things you can go do RIGHT NOW to make money or get an edge (empty array if it's all talk — "consider exploring X" is NOT an action item, "go sign up for Y and use it to do Z" IS)"""
 
 
 def is_youtube_url(url_or_id: str) -> bool:
@@ -128,7 +140,7 @@ def get_proxy_config():
     proxy_url = get_proxy_url()
     if not proxy_url:
         return None
-    return WebshareProxyConfig(proxy_url=proxy_url)
+    return GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
 
 
 def fetch_metadata(video_id: str) -> dict | None:
@@ -153,11 +165,7 @@ def fetch_metadata(video_id: str) -> dict | None:
 def fetch_transcript_captions(video_id: str, languages: list[str] | None = None) -> dict:
     proxy_config = get_proxy_config()
 
-    kwargs = {}
-    if proxy_config:
-        kwargs["proxies"] = proxy_config
-
-    ytt = YouTubeTranscriptApi(**kwargs)
+    ytt = YouTubeTranscriptApi(proxy_config=proxy_config)
     langs = languages or ["en", "en-US", "en-GB"]
     transcript = ytt.fetch(video_id, languages=langs)
 
@@ -194,7 +202,7 @@ def download_audio(url: str, tmpdir: str, use_proxy: bool = False) -> str:
         "yt-dlp", "-x",
         "--audio-format", "mp3",
         "--audio-quality", "9",
-        "--max-filesize", "24M",
+        "--max-filesize", "100M",
         "-o", out_path,
     ]
     if use_proxy:
@@ -424,7 +432,31 @@ def render_analysis(analysis: dict, meta: dict | None):
     # Key points
     out.print("[bold]Key Points[/bold]")
     for i, point in enumerate(analysis.get("key_points", []), 1):
-        out.print(f"  [dim]{i}.[/dim] {point}")
+        if isinstance(point, dict):
+            ts = f"[dim][{point.get('timestamp', '?')}][/dim] " if point.get("timestamp") else ""
+            text = point.get("point", "")
+            bs_flag = point.get("bs_flag")
+            out.print(f"  [dim]{i}.[/dim] {ts}{text}")
+            if bs_flag:
+                out.print(f"     [red]⚠ {bs_flag}[/red]")
+        else:
+            out.print(f"  [dim]{i}.[/dim] {point}")
+
+    # Tools mentioned
+    tools = analysis.get("tools_mentioned", [])
+    if tools:
+        out.print()
+        out.print("[bold]Tools Mentioned[/bold]")
+        for t in tools:
+            if isinstance(t, dict):
+                verdict_colors = {"daily driver": "green", "canceled": "red", "dead to me": "red", "occasional": "yellow"}
+                verdict = t.get("verdict", "")
+                color = next((c for k, c in verdict_colors.items() if k in verdict.lower()), "cyan")
+                out.print(f"  [bold]{t.get('name', '?')}[/bold] — [{color}]{verdict}[/{color}]")
+                if t.get("detail"):
+                    out.print(f"    [dim]{t['detail']}[/dim]")
+            else:
+                out.print(f"  {t}")
 
     # Quotes
     quotes = analysis.get("notable_quotes", [])
@@ -432,7 +464,33 @@ def render_analysis(analysis: dict, meta: dict | None):
         out.print()
         out.print("[bold]Notable Quotes[/bold]")
         for q in quotes:
-            out.print(f'  [italic]"{q}"[/italic]')
+            if isinstance(q, dict):
+                ts = f" [dim][{q.get('timestamp', '?')}][/dim]" if q.get("timestamp") else ""
+                out.print(f'  [italic]"{q.get("quote", q)}"[/italic]{ts}')
+            else:
+                out.print(f'  [italic]"{q}"[/italic]')
+
+    # Bullshit meter
+    bs = analysis.get("bullshit_meter", {})
+    if bs:
+        level = bs.get("level", "?")
+        reasoning = bs.get("reasoning", "")
+        level_colors = {"legit": "green", "mostly_legit": "green", "mixed_bag": "yellow", "heavy_spin": "red", "pure_hype": "red bold"}
+        color = level_colors.get(level, "white")
+        label = level.replace("_", " ")
+        out.print()
+        out.print(f"[bold]Bullshit Meter[/bold]: [{color}]{label}[/{color}]")
+        if reasoning:
+            out.print(f"  [dim]{reasoning}[/dim]")
+
+    # Who cares
+    who_cares = analysis.get("who_cares", {})
+    if who_cares:
+        out.print()
+        out.print("[bold]Who Cares[/bold]")
+        for role, blurb in who_cares.items():
+            if blurb:
+                out.print(f"  [yellow]{role}[/yellow]: {blurb}")
 
     # Action items
     actions = analysis.get("action_items", [])
